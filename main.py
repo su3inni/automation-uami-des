@@ -7,7 +7,7 @@ from azure.mgmt.resource import ResourceManagementClient
 # === 설정 ===
 WORKLOAD_SUBSCRIPTIONS = os.environ["WORKLOAD_SUBSCRIPTIONS"]
 WORKSPACE_ID = os.environ["WORKSPACE_ID"]
-SHARED_KEY = os.environ["SHARED_KEY"]"
+SHARED_KEY = os.environ["SHARED_KEY"]
 
 # uami-<구독>-<워크로드ID>-###-cmk , <resource>-<구독>-<워크로드ID>-#### 
 def extract_subcode_workload(name):
