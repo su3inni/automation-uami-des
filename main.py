@@ -1,17 +1,13 @@
-# python 3.9 azure-identity==1.13.0 \ azure-mgmt-compute==29.1.0 \ azure-mgmt-resource==21.1.0
 #!/usr/bin/env python3
-import json, requests, hashlib, hmac, base64, datetime
+import json, requests, hashlib, hmac, base64, datetime,os
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.compute import ComputeManagementClient
 from azure.mgmt.resource import ResourceManagementClient
 
 # === 설정 ===
-WORKLOAD_SUBSCRIPTIONS = [
-    ""
-]
-WORKSPACE_ID = ""
-SHARED_KEY = ""
-LOG_TYPE = "DESAudit"
+WORKLOAD_SUBSCRIPTIONS = os.environ["WORKLOAD_SUBSCRIPTIONS"]
+WORKSPACE_ID = os.environ["WORKSPACE_ID"]
+SHARED_KEY = os.environ["SHARED_KEY"]"
 
 # uami-<구독>-<워크로드ID>-###-cmk , <resource>-<구독>-<워크로드ID>-#### 
 def extract_subcode_workload(name):
@@ -26,7 +22,7 @@ def build_signature(customer_id, shared_key, date, content_length, method, conte
     encoded_hash = base64.b64encode(hmac.new(decoded_key, bytes_to_hash, digestmod=hashlib.sha256).digest()).decode()
     return f"SharedKey {customer_id}:{encoded_hash}"
 
-def send_log(data):
+def send_log(data,tableName):
     body = json.dumps(data)
     date = datetime.datetime.utcnow().strftime('%a, %d %b %Y %H:%M:%S GMT')
     signature = build_signature(WORKSPACE_ID, SHARED_KEY, date, len(body), 'POST', 'application/json', '/api/logs')
@@ -34,36 +30,18 @@ def send_log(data):
     headers = {
         'Content-Type': 'application/json',
         'Authorization': signature,
-        'Log-Type': LOG_TYPE,
+        'Log-Type': tableName,
         'x-ms-date': date,
         'time-generated-field': 'timeGenerated'
     }
     try:
         r = requests.post(uri, data=body, headers=headers)
         status = "send to log analytics" if r.status_code < 300 else "recheck"
-        print(f"{status} Log sent: {data['desName']}")
+        print(f"{status} Log sent")
     except Exception as e:
         print(f" Exception sending log: {str(e)}")
 
-def find_resources_using_des(resource_client, des_id):
-    matched = []
-    for rg in resource_client.resource_groups.list():
-        for res in resource_client.resources.list_by_resource_group(rg.name):
-            try:
-                res_full = resource_client.resources.get_by_id(res.id, api_version="2023-03-01")
-                props = getattr(res_full, 'properties', None)
-                encryption = getattr(props, 'encryption', None)
-                if encryption and hasattr(encryption, 'diskEncryptionSetId'):
-                    des_ref = getattr(encryption, 'diskEncryptionSetId')
-                    if des_ref and des_id.lower() in des_ref.lower():
-                        matched.append({
-                            "name": res.name,
-                            "type": res.type,
-                            "resourceGroup": rg.name
-                        })
-            except Exception:
-                continue
-    return matched
+
 
 def run():
     cred = DefaultAzureCredential()
@@ -97,7 +75,7 @@ def run():
                         "desName": des_name,
                         "desSubscription":sub_id
                     }
-                send_log(log_data)
+                send_log(log_data,"uamiDes")
 
         # 2) 워크로드 내의 모든 리소스 수집 > uami - resource 확인
         resource = ResourceManagementClient(cred, sub_id)
@@ -109,22 +87,22 @@ def run():
         for rg in resource.resource_groups.list():
             # 리소스 그룹 내 리소스 확인
             for res in resource.resources.list_by_resource_group(rg.name):
-                try:
-                    res_full = resource.resources.get_by_id(res.id, api_version="2023-03-01")
-                    props = getattr(res_full, 'identity', None)
-                    if props and props.type == "UserAssigned":
-                        uami_ids = list(props.user_assigned_identities.keys())
-                        for uami_id in uami_ids:
-                            uname = uami_id.split("/")[-1]
-                            cmkcheck = uname.split("-")[-1]
-                            if cmkcheck!="cmk":
-                                continue
+                identity = res.identity
+                if identity and identity.type == "UserAssigned":
+                    uami_dict = identity.user_assigned_identities  # 이건 dict
+                    uami_ids = list(uami_dict.keys())
+                
+                    for uami_id in uami_ids:
+                        uname = uami_id.split("/")[-1]
+                        cmkcheck = uname.split("-")[-1]
+                        if cmkcheck!="cmk":
+                            continue
 
-                            usub, uwid = extract_subcode_workload(uname)
-                            rsub, rwid = extract_subcode_workload(res.name)
-                            uami_mapping_valid = (uwid == rwid)
+                        usub, uwid = extract_subcode_workload(uname)
+                        rsub, rwid = extract_subcode_workload(res.name)
+                        uami_mapping_valid = (uwid == rwid)
 
-                            log_data = {
+                        log_data = {
                                 "timeGenerated": datetime.datetime.utcnow().isoformat() + "Z",
                                 "uamiWID": uwid,
                                 "resourceWID": rwid,
@@ -133,9 +111,8 @@ def run():
                                 "resourceName": res.name,
                                 "resourceType": res.type,
                                 "resourceSubscription": sub_id
-                            }
-                            send_log(log_data)
-                except Exception as e:
-                    continue
+                        }
+                        #print(log_data)
+                        send_log(log_data,"uamiResource")
 
 run()
