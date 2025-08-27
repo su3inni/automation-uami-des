@@ -13,6 +13,7 @@ WORKSPACE_ID = ""
 SHARED_KEY = ""
 LOG_TYPE = "DESAudit"
 
+# uami-<구독>-<워크로드ID>-###-cmk , <resource>-<구독>-<워크로드ID>-#### 
 def extract_subcode_workload(name):
     parts = name.split("-")
     return (parts[1].lower(), parts[2].lower()) if len(parts) >= 3 else (None, None)
@@ -67,10 +68,10 @@ def find_resources_using_des(resource_client, des_id):
 def run():
     cred = DefaultAzureCredential()
     for sub_id in WORKLOAD_SUBSCRIPTIONS:
+        # 1) 워크로드 내의 compute 리소스 모두 수집 > uami - des 확인
         compute = ComputeManagementClient(cred, sub_id)
-        resource = ResourceManagementClient(cred, sub_id)
 
-        # for rg in resource.resource_groups.list():
+        # 1-1) 워크로드에서 사용하는 des에 대해 des 와 연관된 uami 추출
         for des in compute.disk_encryption_sets.list():
             des_name = des.name
             des_subcode, des_wid = extract_subcode_workload(des_name)
@@ -80,32 +81,61 @@ def run():
             if len(uamis) == 0:
                 continue
 
-            linked_resources = find_resources_using_des(resource, des.id)
-
+            uami_mapping_valid = None
             for uami_id in uamis:
-                if uami_id:
-                    uname = uami_id.split("/")[-1]
-                    _, uwid = extract_subcode_workload(uname)
-                    uami_mapping_valid = (uwid == des_wid)
-
-                for res in linked_resources or [None]:
-                    if res:
-                        rsub, rwid = extract_subcode_workload(res['name'])
-                        resource_mapping_valid = (rsub == des_subcode and rwid == des_wid)
-                        resource_id = f"/subscriptions/{sub_id}/resourceGroups/{res['resourceGroup']}/providers/{res['type']}/{res['name']}"
-                    else:
-                        resource_mapping_valid = None
-                        resource_id = None
-
-                    log_data = {
+                uname = uami_id.split("/")[-1]
+                # uami의 naming rule 에서 필요한 정보 추출 -> 구독, 워크로드ID
+                usub, uwid = extract_subcode_workload(uname)
+                # uwid 와 des의 wid 비교
+                uami_mapping_valid = (uwid == des_wid)
+                log_data = {
                         "timeGenerated": datetime.datetime.utcnow().isoformat() + "Z",
-                        "subscriptionId": sub_id,
-                        "desName": des_name,
-                        "uamiId": uami_id,
+                        "uamiWID": uwid,
+                        "desWID": des_wid,
                         "uamiMappingValid": uami_mapping_valid,
-                        "resourceId": resource_id,
-                        "resourceMappingValid": resource_mapping_valid
+                        "uamiName":uname,
+                        "desName": des_name,
+                        "desSubscription":sub_id
                     }
-                    send_log(log_data)
+                send_log(log_data)
+
+        # 2) 워크로드 내의 모든 리소스 수집 > uami - resource 확인
+        resource = ResourceManagementClient(cred, sub_id)
+
+        # 2) 워크로드 내의 모든 리소스 수집 > uami - resource 확인
+        resource = ResourceManagementClient(cred, sub_id)
+
+        # 구독 내 리소스그룹 확인
+        for rg in resource.resource_groups.list():
+            # 리소스 그룹 내 리소스 확인
+            for res in resource.resources.list_by_resource_group(rg.name):
+                try:
+                    res_full = resource.resources.get_by_id(res.id, api_version="2023-03-01")
+                    props = getattr(res_full, 'identity', None)
+                    if props and props.type == "UserAssigned":
+                        uami_ids = list(props.user_assigned_identities.keys())
+                        for uami_id in uami_ids:
+                            uname = uami_id.split("/")[-1]
+                            cmkcheck = uname.split("-")[-1]
+                            if cmkcheck!="cmk":
+                                continue
+
+                            usub, uwid = extract_subcode_workload(uname)
+                            rsub, rwid = extract_subcode_workload(res.name)
+                            uami_mapping_valid = (uwid == rwid)
+
+                            log_data = {
+                                "timeGenerated": datetime.datetime.utcnow().isoformat() + "Z",
+                                "uamiWID": uwid,
+                                "resourceWID": rwid,
+                                "uamiMappingValid": uami_mapping_valid,
+                                "uamiName": uname,
+                                "resourceName": res.name,
+                                "resourceType": res.type,
+                                "resourceSubscription": sub_id
+                            }
+                            send_log(log_data)
+                except Exception as e:
+                    continue
 
 run()
