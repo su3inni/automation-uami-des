@@ -1,5 +1,5 @@
 
-import logging, json, requests, hashlib, hmac, base64, datetime
+import logging, json, requests, hashlib, hmac, base64, datetime,os
 import azure.functions as func
 
 from azure.identity import DefaultAzureCredential
@@ -8,15 +8,12 @@ from azure.mgmt.compute import ComputeManagementClient
 from azure.mgmt.web import WebSiteManagementClient
 
 # === 설정 ===
-SECURITY_SUBSCRIPTION_ID = "00000000-0000-0000-0000-000000000000"
-WORKLOAD_SUBSCRIPTIONS = [
-    "11111111-1111-1111-1111-111111111111",
-    "22222222-2222-2222-2222-222222222222",
-]
+SECURITY_SUBSCRIPTION_ID = os.environ['SECURITY_SUBSCRIPTION_ID']
+WORKLOAD_SUBSCRIPTIONS = os.environ['WORKLOAD_SUBSCRIPTIONS']
 
-WORKSPACE_ID = "your-workspace-id"
-SHARED_KEY = "your-shared-key"
-LOG_TYPE = "UAMIWorkloadMismatch"
+WORKSPACE_ID = os.environ['WORKSPACE_ID']
+SHARED_KEY = os.environ['SHARED_KEY']
+LOG_TYPE = os.environ['LOG_TYPE']
 
 # === Log Analytics 전송 함수 ===
 def build_signature(customer_id, shared_key, date, content_length, method, content_type, resource):
