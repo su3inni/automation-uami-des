@@ -1,3 +1,4 @@
+azure-functions
 azure-identity==1.13.0
 azure-mgmt-compute==29.1.0
 azure-mgmt-resource==21.1.0
