@@ -7,7 +7,7 @@ from azure.mgmt.resourcegraph import ResourceGraphClient
 from azure.mgmt.resourcegraph.models import QueryRequest
 
 # ========= 환경변수 =========
-# Log Analytics Data Collector API 
+# Log Analytics Data Collector API (DCR/DCE 없이)
 LA_WORKSPACE_ID  = os.getenv("LA_WORKSPACE_ID")          # Workspace ID
 LA_WORKSPACE_KEY = os.getenv("LA_WORKSPACE_KEY")         # Shared Key
 LA_LOGTYPE       = os.getenv("LA_LOGTYPE", "UamiCmkCompliance")  # 최종 테이블: <LogType>_CL
@@ -16,9 +16,8 @@ LA_LOGTYPE       = os.getenv("LA_LOGTYPE", "UamiCmkCompliance")  # 최종 테이
 SECURITY_SUB   = os.getenv("SECURITY_SUB")  # 보안 구독 ID (1개)
 WORKLOAD_SUBS  = [s.strip() for s in os.getenv("WORKLOAD_SUBS","").split(",") if s.strip()]  # 워크로드 구독들
 
-# (옵션) 팀즈 웹훅
+# 팀즈 웹훅
 TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL")
-TEAMS_NOTIFY_ON_OK = os.getenv("TEAMS_NOTIFY_ON_OK", "false").lower() == "true"
 
 # ========= KQL (환경변수에서 받은 구독으로 주입) =========
 def build_kql(security_sub: str, workload_subs: list[str]) -> str:
@@ -94,7 +93,7 @@ def run_arg_query(cred, kql: str, security_sub: str, workload_subs: list[str]):
     resp = client.resources(QueryRequest(subscriptions=subs_scope, query=kql))
     return list(resp.data or [])
 
-# ========= (중요) 컬럼명 정규화: 한글/공백 → 영문 스키마 =========
+# ========= log analytics 적재를 위한 컬럼명 정규화: 한글/공백 → 영문 스키마 =========
 def normalize_row(row: dict) -> dict:
     return {
         "Compliance":               row.get("규정 준수 여부"),
@@ -107,7 +106,6 @@ def normalize_row(row: dict) -> dict:
         "LinkedSubId":              row.get("연결 리소스 구독 ID"),
         "LinkedResourceType":       row.get("연결 리소스 타입"),
     }
-
 # ========= Data Collector API 업로드 =========
 def _dc_build_signature(date_rfc1123: str, content_length_bytes: int,
                         method="POST", content_type="application/json", resource="/api/logs"):
@@ -142,19 +140,19 @@ def _post_chunk(chunk: list[dict]):
             pass
         time.sleep(2 + attempt)
 
-def ingest_via_data_collector(rows: list[dict], max_chunk=1000):
+def logging_to_la(rows: list[dict], max_chunk=1000):
     for i in range(0, len(rows), max_chunk):
         _post_chunk(rows[i:i+max_chunk])
 
 # ========= 요약 & 팀즈 알림 =========
 def summarize(rows: list[dict]) -> dict:
-    MISMATCH = "🔴 Mismatch"
-    mism = [r for r in rows if r.get("Compliance") == MISMATCH]
+    mism = [r for r in rows if r.get("Compliance") == "🔴 Mismatch"]
     unk  = [r for r in rows if r.get("Compliance") == "Unknown"]
     ok   = [r for r in rows if r.get("Compliance") == "🟢 OK"]
 
     def line(r):
-        return f"- {r.get('UamiName')} → {r.get('LinkedResourceName')} | Sub: {r.get('LinkedSubName')} ({r.get('LinkedSubId')}) | 2nd4={r.get('Compare2nd4')}"
+        return (f"- {r.get('UamiName')} → {r.get('LinkedResourceName')} \n"
+        f"   - Resource subscription: {r.get('LinkedSubName')} ({r.get('LinkedSubId')}) \n\n")
     preview = "\n".join([line(r) for r in mism[:10]]) or "- (위반 없음)"
 
     return {"total": len(rows), "mismatch": len(mism), "unknown": len(unk), "ok": len(ok), "preview": preview}
@@ -162,12 +160,12 @@ def summarize(rows: list[dict]) -> dict:
 def notify_teams(summary: dict):
     if not TEAMS_WEBHOOK_URL:
         return
-    if summary["mismatch"] == 0 and not TEAMS_NOTIFY_ON_OK:
+    if summary["mismatch"] == 0 :
         return
     title = f"UAMI CMK 규정 위반 {summary['mismatch']}건" if summary["mismatch"] else "UAMI CMK 검사 결과 (위반 없음)"
     text  = (f"총 {summary['total']}건 검사\n"
-             f"✅ OK: {summary['ok']} / ⚠️ Unknown: {summary['unknown']} / 🔴 Mismatch: {summary['mismatch']}\n\n"
-             f"상위 위반 예시:\n{summary['preview']}")
+             f"✅ OK: {summary['ok']} / ⚠ Unknown: {summary['unknown']} / 🔴 Mismatch: {summary['mismatch']}\n\n"
+             f"\n example \n\n {summary['preview']}")
     payload = {"text": f"**{title}**\n\n{text}"}
     try:
         requests.post(TEAMS_WEBHOOK_URL, json=payload, timeout=10).raise_for_status()
@@ -188,7 +186,7 @@ def main(timer: func.TimerRequest):
     kql   = build_kql(SECURITY_SUB, WORKLOAD_SUBS)
     raw   = run_arg_query(cred, kql, SECURITY_SUB, WORKLOAD_SUBS)
 
-    # 2) 컬럼 정규화 + RunTime/RunId 주입
+    # 2) log analytics 적재를 위한 컬럼 정규화 + RunTime/RunId 주입
     rows = []
     for row in raw:
         n = normalize_row(row)
@@ -197,7 +195,7 @@ def main(timer: func.TimerRequest):
         rows.append(n)
 
     # 3) Log Analytics 적재 (Collector API)
-    ingest_via_data_collector(rows, max_chunk=1000)
+    logging_to_la(rows, max_chunk=1000)
 
     # 4) Teams 알림(선택)
     summary = summarize(rows)
