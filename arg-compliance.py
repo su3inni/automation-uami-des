@@ -2,7 +2,7 @@ import os, json, hmac, hashlib, base64, datetime as dt, time
 import azure.functions as func
 import requests
 
-from azure.identity import DefaultAzureCredential
+from azure.identity import ManagedIdentityCredential
 from azure.mgmt.resourcegraph import ResourceGraphClient
 from azure.mgmt.resourcegraph.models import QueryRequest
 
@@ -22,67 +22,50 @@ TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL")
 # ========= KQL (환경변수에서 받은 구독으로 주입) =========
 def build_kql(security_sub: str, workload_subs: list[str]) -> str:
     wl = ",".join([f"'{s}'" for s in workload_subs])
-    return f"""
-(
-  Resources
-  | where subscriptionId in (dynamic(['{security_sub}']))
-  | where type =~ 'microsoft.managedidentity/userAssignedIdentities'
-  | extend uamiId   = tolower(tostring(id))
-  | extend uamiName = tolower(extract('/([^/]+)$', 1, tostring(id)))  // uami-...-cmk
-  | extend uamiSubGuid = tolower(tostring(subscriptionId))
-  | extend nameParts  = split(uamiName, '-')
-  | extend partsCount = array_length(nameParts)
-  | extend secondTok  = tostring(nameParts[1])                         // 두 번째 토큰
-  | extend lastTok    = tostring(nameParts[partsCount-1])              // 마지막 토큰
-  | where lastTok == 'cmk'
-  | extend nameSecond4 = iff(secondTok matches regex '^[0-9a-f]{{4}}$', secondTok, '')
-  | project uamiId, uamiName, uamiSubGuid, nameSecond4
-)
-| join kind=inner (
-  Resources
-  | where subscriptionId in (dynamic([{wl}]))
-  | extend uamiMap = coalesce(identity.userAssignedIdentities, dynamic({{}}))
-  | mv-expand assignedUamiId = bag_keys(uamiMap)
-  | where isnotempty(assignedUamiId)
-  | project linkedResourceId   = id,
-            linkedResourceName = name,
-            linkedResourceType = type,
-            linkedSubGuid      = tolower(tostring(subscriptionId)),
-            uamiId             = tolower(tostring(assignedUamiId))
-) on uamiId
+    return f""" 
+resources
+| where type =~ 'microsoft.managedidentity/userassignedidentities'
+| where subscriptionId == f'{SECURITY_SUB}'
+| extend purpose = tostring(tags['Purpose']),
+         targetSubId = tolower(tostring(tags['TargetSubscriptionId']))
+| where purpose =~ 'mhsm-cmk' and isnotempty(targetSubId)
+| project uamiId = id, uamiName = name, uamiRg = resourceGroup, uamiLocation = location, targetSubId, purpose
 | join kind=leftouter (
-    ResourceContainers
-    | where type =~ 'microsoft.resources/subscriptions'
-    | project uamiSubGuid = tolower(split(tostring(id), '/')[2]),
-              uamiSubName = tostring(name)
-  ) on uamiSubGuid
+    resources
+    | where isnotempty(identity)
+    | extend uamiMap = todynamic(identity.userAssignedIdentities)
+    | where isnotempty(uamiMap)
+    | mv-expand uamiRef = bag_keys(uamiMap)
+    | extend usedUamiId = tostring(uamiRef)
+    | project usingResourceId = id, usingResourceType = type, usingResourceName = name,
+              usingResourceRg = resourceGroup, usingSubscriptionId = tolower(subscriptionId),
+              usedUamiId
+  ) on $left.uamiId == $right.usedUamiId
+| extend compliant = iff(isempty(usingResourceId), '—(미사용)',
+                         iff(usingSubscriptionId == targetSubId, '✅ OK', '❌ Audit'))
+// === 구독 이름 매핑 추가 ===
 | join kind=leftouter (
-    ResourceContainers
-    | where type =~ 'microsoft.resources/subscriptions'
-    | project linkedSubGuid = tolower(split(tostring(id), '/')[2]),
-              linkedSubName = tostring(name)
-  ) on linkedSubGuid
-| extend resSecond4 = extract('^[0-9a-f]{{8}}-([0-9a-f]{{4}})-', 1, linkedSubGuid)
-| extend Compliance = case(
-    isempty(nameSecond4) or isempty(resSecond4), 'Unknown',
-    nameSecond4 == resSecond4, '🟢 OK', '🔴 Mismatch'
-  )
-| extend Compare_2nd4 = strcat(
-    iif(isempty(nameSecond4), '-', nameSecond4),
-    '/',
-    iif(isempty(resSecond4),  '-', resSecond4)
-  )
+    resourcecontainers
+    | where type == 'microsoft.resources/subscriptions'
+    | project usingSubscriptionId = tolower(subscriptionId),
+              usingSubscriptionName = name
+  ) on usingSubscriptionId
+| join kind=leftouter (
+    resourcecontainers
+    | where type == 'microsoft.resources/subscriptions'
+    | project targetSubId = tolower(subscriptionId),
+              targetSubscriptionName = name
+  ) on targetSubId
 | project
-    ['규정 준수 여부']             = Compliance,
-    ['UAMI 이름']                 = uamiName,
-    ['연결 리소스 이름']           = linkedResourceName,
-    ['비교 결과 : UAMI/리소스']   = Compare_2nd4,
-    ['UAMI 구독 이름']            = coalesce(uamiSubName, uamiSubGuid),
-    ['UAMI 구독 ID']              = uamiSubGuid,
-    ['연결 리소스 구독 이름']     = coalesce(linkedSubName, linkedSubGuid),
-    ['연결 리소스 구독 ID']       = linkedSubGuid,
-    ['연결 리소스 타입']          = linkedResourceType
-| order by ['규정 준수 여부'] asc, ['연결 리소스 구독 이름'] asc, ['UAMI 이름'] asc
+    ["컴플라이언스 준수"] = compliant,
+    ["UAMI 이름"] = uamiName, 
+    ["할당 구독명"] = targetSubscriptionName, 
+//    ["할당 구독 ID"] = targetSubId,
+    ["사용 구독명"] = usingSubscriptionName,
+//    ["사용 구독ID"] = usingSubscriptionId,
+    ["사용 리소스 타입"] = usingResourceType, 
+    ["사용 리소스 명"] = usingResourceName, 
+    ["사용 리소스 그룹"] = usingResourceRg
 """
 
 # ========= ARG 실행 =========
@@ -96,15 +79,13 @@ def run_arg_query(cred, kql: str, security_sub: str, workload_subs: list[str]):
 # ========= log analytics 적재를 위한 컬럼명 정규화: 한글/공백 → 영문 스키마 =========
 def normalize_row(row: dict) -> dict:
     return {
-        "Compliance":               row.get("규정 준수 여부"),
+        "Compliance":               row.get("컴플라이언스 준수"),
         "UamiName":                 row.get("UAMI 이름"),
-        "LinkedResourceName":       row.get("연결 리소스 이름"),
-        "Compare2nd4":              row.get("비교 결과 : UAMI/리소스"),
-        "UamiSubName":              row.get("UAMI 구독 이름"),
-        "UamiSubId":                row.get("UAMI 구독 ID"),
-        "LinkedSubName":            row.get("연결 리소스 구독 이름"),
-        "LinkedSubId":              row.get("연결 리소스 구독 ID"),
-        "LinkedResourceType":       row.get("연결 리소스 타입"),
+        "Assigned SubName":         row.get("할당 구독명"),
+        "Used SubName":             row.get("사용 구독명"),
+        "Used ResourceType":        row.get("사용 리소스 타입"),
+        "Used ResourceName":        row.get("사용 리소스 명"),
+        "Used ResourceGroup":       row.get("사용 리소스 그룹")
     }
 # ========= Data Collector API 업로드 =========
 def _dc_build_signature(date_rfc1123: str, content_length_bytes: int,
@@ -146,16 +127,15 @@ def logging_to_la(rows: list[dict], max_chunk=1000):
 
 # ========= 요약 & 팀즈 알림 =========
 def summarize(rows: list[dict]) -> dict:
-    mism = [r for r in rows if r.get("Compliance") == "🔴 Mismatch"]
-    unk  = [r for r in rows if r.get("Compliance") == "Unknown"]
-    ok   = [r for r in rows if r.get("Compliance") == "🟢 OK"]
+    mism = [r for r in rows if r.get("Compliance") == "❌ Audit"]
+    ok   = [r for r in rows if r.get("Compliance") == "✅ OK"]
 
     def line(r):
         return (f"- {r.get('UamiName')} → {r.get('LinkedResourceName')} \n"
         f"   - Resource subscription: {r.get('LinkedSubName')} ({r.get('LinkedSubId')}) \n\n")
     preview = "\n".join([line(r) for r in mism[:10]]) or "- (위반 없음)"
 
-    return {"total": len(rows), "mismatch": len(mism), "unknown": len(unk), "ok": len(ok), "preview": preview}
+    return {"total": len(rows), "mismatch": len(mism), "ok": len(ok), "preview": preview}
 
 def notify_teams(summary: dict):
     if not TEAMS_WEBHOOK_URL:
@@ -164,7 +144,7 @@ def notify_teams(summary: dict):
         return
     title = f"UAMI CMK 규정 위반 {summary['mismatch']}건" if summary["mismatch"] else "UAMI CMK 검사 결과 (위반 없음)"
     text  = (f"총 {summary['total']}건 검사\n"
-             f"✅ OK: {summary['ok']} / ⚠ Unknown: {summary['unknown']} / 🔴 Mismatch: {summary['mismatch']}\n\n"
+             f"✅ OK: {summary['ok']} / ❌ Audit: {summary['mismatch']}\n\n"
              f"\n example \n\n {summary['preview']}")
     payload = {"text": f"**{title}**\n\n{text}"}
     try:
@@ -173,12 +153,13 @@ def notify_teams(summary: dict):
         pass  # 실패 시 로깅만
 
 # ========= 메인 =========
-def main(timer: func.TimerRequest):
+def main(mytimer: func.TimerRequest) -> None:
     # 필수 체크
     if not (LA_WORKSPACE_ID and LA_WORKSPACE_KEY and SECURITY_SUB and WORKLOAD_SUBS):
         return
 
-    cred   = DefaultAzureCredential()
+    cred = ManagedIdentityCredential(client_id=os.environ["UAMI_CLIENT_ID"])
+    #cred   = DefaultAzureCredential()
     run_ts = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
     run_id = run_ts.strftime("%Y%m%d%H%M")
 
